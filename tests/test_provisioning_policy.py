@@ -1,4 +1,7 @@
+import os
+
 from provisioning_policy import build_container_runtime_config, normalize_vps_credentials, validate_vps_request
+from bot import get_env_setting
 
 
 def test_runtime_config_avoids_privileged_access():
@@ -27,3 +30,8 @@ def test_normalize_vps_credentials_uses_provided_values():
     username, password = normalize_vps_credentials("custom-user", "custom-pass")
     assert username == "custom-user"
     assert password == "custom-pass"
+
+
+def test_get_env_setting_reads_runtime_environment(monkeypatch):
+    monkeypatch.setenv("DISCORD_TOKEN", "runtime-token")
+    assert get_env_setting("DISCORD_TOKEN", "BOT_TOKEN") == "runtime-token"

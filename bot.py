@@ -46,17 +46,27 @@ logger = logging.getLogger('HostForgeBot')
 # Load environment variables
 load_dotenv()
 
+
+def get_env_setting(*names, default=None):
+    """Read a setting from the runtime environment, falling back to .env values if available."""
+    for name in names:
+        value = os.getenv(name)
+        if value not in (None, ""):
+            return value
+    return default
+
+
 # Bot configuration
-TOKEN = os.getenv('DISCORD_TOKEN')
-HOST_IP = os.getenv('HOST_IP')  # Optional, will fetch dynamically if not set
-ADMIN_IDS = {int(id_) for id_ in os.getenv('ADMIN_IDS', '1210291131301101618').split(',') if id_.strip()}
-ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID', '1376177459870961694'))
+TOKEN = get_env_setting('DISCORD_TOKEN', 'BOT_TOKEN')
+HOST_IP = get_env_setting('HOST_IP', default=None)  # Optional, will fetch dynamically if not set
+ADMIN_IDS = {int(id_) for id_ in get_env_setting('ADMIN_IDS', default='1210291131301101618').split(',') if id_.strip()}
+ADMIN_ROLE_ID = int(get_env_setting('ADMIN_ROLE_ID', default='1376177459870961694'))
 WATERMARK = "HostForge VPS Service"
 WELCOME_MESSAGE = "Welcome To HostForge! Get Started With Us!"
-MAX_VPS_PER_USER = int(os.getenv('MAX_VPS_PER_USER', '3'))
-DEFAULT_OS_IMAGE = os.getenv('DEFAULT_OS_IMAGE', 'ubuntu:22.04')
-DOCKER_NETWORK = os.getenv('DOCKER_NETWORK', 'bridge')
-MAX_CONTAINERS = int(os.getenv('MAX_CONTAINERS', '100'))
+MAX_VPS_PER_USER = int(get_env_setting('MAX_VPS_PER_USER', default='3'))
+DEFAULT_OS_IMAGE = get_env_setting('DEFAULT_OS_IMAGE', default='ubuntu:22.04')
+DOCKER_NETWORK = get_env_setting('DOCKER_NETWORK', default='bridge')
+MAX_CONTAINERS = int(get_env_setting('MAX_CONTAINERS', default='100'))
 DB_FILE = 'hostforge.db'
 BACKUP_FILE = 'hostforge_backup.pkl'
 PORT_RANGE_START = 20000
