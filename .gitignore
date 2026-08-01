@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+hostforge.db
+hostforge_backup.pkl
+temp_dockerfiles/
