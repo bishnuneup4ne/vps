@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from bot import Database, humanize_bytes
+from bot import Database, humanize_bytes, should_use_simulated_vps
 
 
 def test_activity_log_and_quota_management(tmp_path):
@@ -29,3 +29,7 @@ def test_snapshot_tracking_and_cleanup(tmp_path):
 def test_humanize_bytes_formats_sizes():
     assert humanize_bytes(1024) == "1.0 KB"
     assert humanize_bytes(1536) == "1.5 KB"
+
+
+def test_simulated_vps_mode_when_docker_is_unavailable():
+    assert should_use_simulated_vps(None) is True

@@ -666,6 +666,11 @@ def generate_ssh_password(length: int = 16):
     alphabet = string.ascii_letters + string.digits
     return ''.join(random.choice(alphabet) for _ in range(length))
 
+
+def should_use_simulated_vps(docker_client) -> bool:
+    """Return True when the bot should run in a non-Docker fallback mode."""
+    return docker_client is None
+
 async def capture_ssh_session_line(process):
     """Capture the SSH session line from tmate output"""
     try:
@@ -1325,31 +1330,59 @@ async def create_vps_flow(ctx, memory: int, cpu: int, disk: int, owner: discord.
                          username: Optional[str] = None, password: Optional[str] = None):
     """Create a VPS using the supplied or prompted credentials."""
     if not has_admin_role(ctx):
-        if isinstance(ctx, discord.Interaction):
-            await ctx.followup.send("❌ You must be an admin to use this command!", ephemeral=True)
-        else:
-            await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        await send_ephemeral_message(ctx, "❌ You must be an admin to use this command!")
         return
 
     if bot.db.is_user_banned(owner.id):
-        if isinstance(ctx, discord.Interaction):
-            await ctx.followup.send("❌ This user is banned from creating VPS!", ephemeral=True)
-        else:
-            await ctx.send("❌ This user is banned from creating VPS!", ephemeral=True)
+        await send_ephemeral_message(ctx, "❌ This user is banned from creating VPS!")
         return
 
     if not getattr(ctx, "guild", None):
-        if isinstance(ctx, discord.Interaction):
-            await ctx.followup.send("❌ This command can only be used in a server!", ephemeral=True)
-        else:
-            await ctx.send("❌ This command can only be used in a server!", ephemeral=True)
+        await send_ephemeral_message(ctx, "❌ This command can only be used in a server!")
         return
 
-    if not bot.docker_client:
-        if isinstance(ctx, discord.Interaction):
-            await ctx.followup.send("❌ Docker is not available. Please contact the administrator.", ephemeral=True)
-        else:
-            await ctx.send("❌ Docker is not available. Please contact the administrator.", ephemeral=True)
+    if should_use_simulated_vps(bot.docker_client):
+        await send_ephemeral_message(ctx, "⚠️ Docker is unavailable, so the VPS will be created in simulated mode. The instance will be registered for later provisioning.")
+        vps_id = generate_vps_id()
+        username, password = normalize_vps_credentials(username, password)
+        token = generate_token()
+        external_port = get_available_port(bot.db)
+        vps_data = {
+            "token": token,
+            "vps_id": vps_id,
+            "container_id": None,
+            "memory": memory,
+            "cpu": cpu,
+            "disk": disk,
+            "username": username,
+            "password": password,
+            "root_password": password,
+            "created_by": str(owner.id),
+            "created_at": str(datetime.datetime.now()),
+            "tmate_session": None,
+            "watermark": WATERMARK,
+            "os_image": os_image,
+            "restart_count": 0,
+            "last_restart": None,
+            "status": "simulated",
+            "use_custom_image": use_custom_image,
+            "external_ssh_port": external_port,
+        }
+        bot.db.add_vps(vps_data)
+        bot.db.log_activity('create_vps', actor=str(owner.id), target=vps_id, detail=f"memory={memory} cpu={cpu} disk={disk} simulated")
+
+        try:
+            embed = discord.Embed(title="📝 VPS Registered in Simulated Mode", color=discord.Color.orange())
+            embed.add_field(name="🆔 VPS ID", value=vps_id, inline=True)
+            embed.add_field(name="💾 Memory", value=f"{memory}GB", inline=True)
+            embed.add_field(name="⚡ CPU", value=f"{cpu} cores", inline=True)
+            embed.add_field(name="💿 Disk", value=f"{disk}GB", inline=True)
+            embed.add_field(name="👤 Username", value=username, inline=True)
+            embed.add_field(name="🔑 Password", value=f"||{password}||", inline=False)
+            embed.add_field(name="ℹ️ Note", value="Docker is unavailable right now, so this VPS was registered for later provisioning.", inline=False)
+            await owner.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning("Could not send simulated VPS details to owner")
         return
 
     try:
@@ -1529,7 +1562,7 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
                            os_image: str = DEFAULT_OS_IMAGE, use_custom_image: bool = True,
                            username: Optional[str] = None, password: Optional[str] = None):
     """Create a new VPS with specified parameters (Admin only)"""
-    if isinstance(ctx, discord.Interaction):
+    if is_interaction_context(ctx):
         if username is None or password is None:
             modal = CreateVPSCredentialsModal(memory, cpu, disk, owner, os_image, use_custom_image)
             await ctx.response.send_modal(modal)
@@ -1538,8 +1571,7 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
         return
 
     if username is None or password is None:
-        await ctx.send("Please provide a username and password for the VPS using the slash command, or use the interactive flow in Discord.", ephemeral=True)
-        return
+        username, password = normalize_vps_credentials(None, None)
 
     await create_vps_flow(ctx, memory, cpu, disk, owner, os_image, use_custom_image, username, password)
 
