@@ -71,6 +71,17 @@ def is_interaction_context(ctx) -> bool:
     return hasattr(ctx, 'response') and hasattr(ctx, 'followup') and hasattr(ctx, 'user')
 
 
+async def send_ephemeral_message(ctx, message: str):
+    """Send a message that works for both slash commands and regular command contexts."""
+    if is_interaction_context(ctx):
+        if hasattr(ctx, 'response') and not ctx.response.is_done():
+            await ctx.response.send_message(message, ephemeral=True)
+        else:
+            await ctx.followup.send(message, ephemeral=True)
+    else:
+        await ctx.send(message, ephemeral=True)
+
+
 # Bot configuration
 TOKEN = get_env_setting('DISCORD_TOKEN', 'BOT_TOKEN')
 HOST_IP = get_env_setting('HOST_IP', default=None)  # Optional, will fetch dynamically if not set
