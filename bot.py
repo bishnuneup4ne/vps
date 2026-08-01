@@ -26,6 +26,7 @@ import pickle
 import base64
 import threading
 from flask import Flask, render_template, request, jsonify, session
+from collections import Counter
 from flask_socketio import SocketIO, emit
 import docker
 import paramiko
@@ -46,6 +47,13 @@ logger = logging.getLogger('HostForgeBot')
 # Load environment variables
 load_dotenv()
 
+STARTUP_NOTES = []
+
+
+def add_startup_note(message: str):
+    STARTUP_NOTES.append(message)
+    logger.info(message)
+
 
 def get_env_setting(*names, default=None):
     """Read a setting from the runtime environment, falling back to .env values if available."""
@@ -61,6 +69,8 @@ TOKEN = get_env_setting('DISCORD_TOKEN', 'BOT_TOKEN')
 HOST_IP = get_env_setting('HOST_IP', default=None)  # Optional, will fetch dynamically if not set
 ADMIN_IDS = {int(id_) for id_ in get_env_setting('ADMIN_IDS', default='1210291131301101618').split(',') if id_.strip()}
 ADMIN_ROLE_ID = int(get_env_setting('ADMIN_ROLE_ID', default='1376177459870961694'))
+if not TOKEN:
+    add_startup_note("DISCORD_TOKEN is not configured; the bot will fail until a token is provided.")
 WATERMARK = "HostForge VPS Service"
 WELCOME_MESSAGE = "Welcome To HostForge! Get Started With Us!"
 MAX_VPS_PER_USER = int(get_env_setting('MAX_VPS_PER_USER', default='3'))
@@ -400,18 +410,17 @@ class HostForgeBot(commands.Bot):
         self.session = aiohttp.ClientSession()
         try:
             self.docker_client = docker.from_env()
-            logger.info("Docker client initialized successfully")
+            add_startup_note("Docker client initialized successfully")
             self.public_ip = HOST_IP or await self.get_public_ip()
-            logger.info(f"Public IP: {self.public_ip}")
+            add_startup_note(f"Public IP: {self.public_ip}")
             self.loop.create_task(self.update_system_stats())
             self.loop.create_task(self.anti_miner_monitor())
-            # Reconnect to existing containers
             await self.reconnect_containers()
-            # Restore persistent views
             await self.restore_persistent_views()
         except Exception as e:
             logger.error(f"Failed to initialize Docker client: {e}")
             self.docker_client = None
+            add_startup_note("Docker integration is unavailable; VPS operations will be limited.")
 
     async def get_public_ip(self):
         try:
@@ -818,6 +827,26 @@ async def on_ready():
         logger.info(f"Synced {len(synced_commands)} slash commands")
     except Exception as e:
         logger.error(f"Error syncing slash commands: {e}")
+
+@bot.hybrid_command(name='health', description='Show bot health and deployment status')
+async def health_check(ctx):
+    """Show bot health and configuration status."""
+    try:
+        docker_status = "available" if bot.docker_client else "unavailable"
+        container_count = len(bot.db.get_all_vps())
+        running_count = sum(1 for vps in bot.db.get_all_vps().values() if vps.get('status') == 'running')
+        embed = discord.Embed(title="Bot Health", color=discord.Color.green())
+        embed.add_field(name="Discord Token", value="configured" if TOKEN else "missing", inline=True)
+        embed.add_field(name="Docker", value=docker_status, inline=True)
+        embed.add_field(name="Public IP", value=bot.public_ip or "unknown", inline=True)
+        embed.add_field(name="VPS Records", value=f"{container_count} total / {running_count} running", inline=True)
+        if STARTUP_NOTES:
+            embed.add_field(name="Startup Notes", value="\n".join(STARTUP_NOTES[-5:]), inline=False)
+        await ctx.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in health_check: {e}")
+        await ctx.send("❌ Error fetching health info.", ephemeral=True)
+
 
 @bot.hybrid_command(name='help', description='Show all available commands')
 async def show_commands(ctx):
