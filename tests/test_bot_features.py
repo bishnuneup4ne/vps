@@ -42,5 +42,11 @@ def test_interaction_context_detection():
             self.followup = object()
             self.user = object()
 
+    class DummyHybridContext:
+        def __init__(self):
+            self.interaction = object()
+            self.user = object()
+
     assert is_interaction_context(DummyInteraction()) is True
+    assert is_interaction_context(DummyHybridContext()) is True
     assert is_interaction_context(object()) is False

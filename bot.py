@@ -68,16 +68,26 @@ def is_interaction_context(ctx) -> bool:
     """Return True when the context is a Discord interaction-based command invocation."""
     if isinstance(ctx, discord.Interaction):
         return True
+    if hasattr(ctx, 'interaction') and getattr(ctx, 'interaction') is not None:
+        return True
     return hasattr(ctx, 'response') and hasattr(ctx, 'followup') and hasattr(ctx, 'user')
+
+
+def has_vps_credentials(username: Optional[str], password: Optional[str]) -> bool:
+    """Return True when both a username and password were provided for VPS creation."""
+    return bool((username or "").strip()) and bool((password or "").strip())
 
 
 async def send_ephemeral_message(ctx, message: str):
     """Send a message that works for both slash commands and regular command contexts."""
     if is_interaction_context(ctx):
-        if hasattr(ctx, 'response') and not ctx.response.is_done():
-            await ctx.response.send_message(message, ephemeral=True)
+        interaction_ctx = getattr(ctx, 'interaction', ctx)
+        if hasattr(interaction_ctx, 'response') and not interaction_ctx.response.is_done():
+            await interaction_ctx.response.send_message(message, ephemeral=True)
+        elif hasattr(interaction_ctx, 'followup'):
+            await interaction_ctx.followup.send(message, ephemeral=True)
         else:
-            await ctx.followup.send(message, ephemeral=True)
+            await ctx.send(message, ephemeral=True)
     else:
         await ctx.send(message, ephemeral=True)
 
@@ -1581,14 +1591,14 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
                            username: Optional[str] = None, password: Optional[str] = None):
     """Create a new VPS with specified parameters (Admin only)"""
     if is_interaction_context(ctx):
-        if username is None or password is None:
+        if not has_vps_credentials(username, password):
             modal = CreateVPSCredentialsModal(memory, cpu, disk, owner, os_image, use_custom_image)
             await ctx.response.send_modal(modal)
             return
         await create_vps_flow(ctx, memory, cpu, disk, owner, os_image, use_custom_image, username, password)
         return
 
-    if username is None or password is None:
+    if not has_vps_credentials(username, password):
         username, password = normalize_vps_credentials(None, None)
 
     await create_vps_flow(ctx, memory, cpu, disk, owner, os_image, use_custom_image, username, password)
