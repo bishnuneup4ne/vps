@@ -134,6 +134,21 @@ STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
 """
 
+
+def humanize_bytes(size_bytes: int) -> str:
+    """Format byte counts into a human-readable size string."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    size_kb = size_bytes / 1024
+    if size_kb < 1024:
+        return f"{size_kb:.1f} KB"
+    size_mb = size_kb / 1024
+    if size_mb < 1024:
+        return f"{size_mb:.1f} MB"
+    size_gb = size_mb / 1024
+    return f"{size_gb:.1f} GB"
+
+
 class Database:
     """Handles all data persistence using SQLite3"""
     def __init__(self, db_file):
@@ -193,6 +208,35 @@ class Database:
                 user_id TEXT PRIMARY KEY
             )
         ''')
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                actor TEXT,
+                target TEXT,
+                detail TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                vps_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                created_by TEXT,
+                size_bytes INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_quotas (
+                user_id TEXT PRIMARY KEY,
+                quota INTEGER NOT NULL DEFAULT 0
+            )
+        ''')
         
         self.conn.commit()
 
@@ -209,8 +253,75 @@ class Database:
         self.cursor.execute('SELECT user_id FROM admin_users')
         for row in self.cursor.fetchall():
             ADMIN_IDS.add(int(row[0]))
+
+        self.cursor.execute('SELECT value FROM system_settings WHERE key = ?', ('auto_cleanup_enabled',))
+        if self.cursor.fetchone() is None:
+            self.cursor.execute('INSERT INTO system_settings (key, value) VALUES (?, ?)', ('auto_cleanup_enabled', '1'))
             
         self.conn.commit()
+
+    def log_activity(self, action, actor=None, target=None, detail=None):
+        self.cursor.execute(
+            'INSERT INTO activity_log (action, actor, target, detail) VALUES (?, ?, ?, ?)',
+            (action, str(actor) if actor is not None else None, target, detail)
+        )
+        self.conn.commit()
+
+    def get_recent_activity(self, limit=10):
+        self.cursor.execute(
+            'SELECT action, actor, target, detail, created_at FROM activity_log ORDER BY id DESC LIMIT ?',
+            (limit,)
+        )
+        rows = self.cursor.fetchall()
+        return [
+            {
+                'action': row[0],
+                'actor': row[1],
+                'target': row[2],
+                'detail': row[3],
+                'created_at': row[4],
+            }
+            for row in rows
+        ]
+
+    def set_user_quota(self, user_id, quota):
+        self.cursor.execute('INSERT OR REPLACE INTO user_quotas (user_id, quota) VALUES (?, ?)', (str(user_id), int(quota)))
+        self.conn.commit()
+
+    def get_user_quota(self, user_id):
+        self.cursor.execute('SELECT quota FROM user_quotas WHERE user_id = ?', (str(user_id),))
+        result = self.cursor.fetchone()
+        return int(result[0]) if result else None
+
+    def get_quota_limit(self, user_id, default=None):
+        quota = self.get_user_quota(user_id)
+        return quota if quota is not None else default
+
+    def add_snapshot(self, vps_id, snapshot_id, path, created_by=None, size_bytes=0):
+        self.cursor.execute(
+            'INSERT OR REPLACE INTO snapshots (snapshot_id, vps_id, path, created_by, size_bytes) VALUES (?, ?, ?, ?, ?)',
+            (snapshot_id, vps_id, path, str(created_by) if created_by is not None else None, int(size_bytes))
+        )
+        self.conn.commit()
+
+    def list_snapshots(self, vps_id):
+        self.cursor.execute('SELECT snapshot_id, path, created_by, size_bytes, created_at FROM snapshots WHERE vps_id = ? ORDER BY created_at DESC', (vps_id,))
+        rows = self.cursor.fetchall()
+        return [
+            {
+                'snapshot_id': row[0],
+                'path': row[1],
+                'created_by': row[2],
+                'size_bytes': row[3],
+                'created_at': row[4],
+            }
+            for row in rows
+        ]
+
+    def delete_snapshot(self, snapshot_id):
+        self.cursor.execute('DELETE FROM snapshots WHERE snapshot_id = ?', (snapshot_id,))
+        self.conn.commit()
+        return self.cursor.rowcount > 0
 
     def get_setting(self, key, default=None):
         self.cursor.execute('SELECT value FROM system_settings WHERE key = ?', (key,))
@@ -848,6 +959,203 @@ async def health_check(ctx):
         await ctx.send("❌ Error fetching health info.", ephemeral=True)
 
 
+@bot.hybrid_command(name='backup_report', description='Show backup and storage status (Admin only)')
+async def backup_report(ctx):
+    """Show backup-related status and storage info."""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        data_exists = os.path.exists(BACKUP_FILE)
+        backup_age = None
+        if data_exists:
+            backup_age = time.time() - os.path.getmtime(BACKUP_FILE)
+        embed = discord.Embed(title="Backup Report", color=discord.Color.blue())
+        embed.add_field(name="Backup File", value="present" if data_exists else "missing", inline=True)
+        if backup_age is not None:
+            embed.add_field(name="Backup Age", value=f"{int(backup_age // 60)} minutes", inline=True)
+        embed.add_field(name="Database File", value="present" if os.path.exists(DB_FILE) else "missing", inline=True)
+        embed.add_field(name="Auto Cleanup", value="enabled" if bot.db.get_setting('auto_cleanup_enabled', 1) else "disabled", inline=True)
+        await ctx.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in backup_report: {e}")
+        await ctx.send("❌ Error fetching backup report.", ephemeral=True)
+
+
+@bot.hybrid_command(name='toggle_auto_cleanup', description='Enable or disable automatic cleanup (Admin only)')
+async def toggle_auto_cleanup(ctx):
+    """Toggle automatic cleanup for inactive VPS instances."""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    enabled = bot.db.get_setting('auto_cleanup_enabled', 1)
+    bot.db.set_setting('auto_cleanup_enabled', 0 if enabled else 1)
+    await ctx.send(f"✅ Auto cleanup {'disabled' if not enabled else 'enabled'}", ephemeral=True)
+
+
+@bot.hybrid_command(name='activity_log', description='Show recent bot activity (Admin only)')
+async def activity_log(ctx):
+    """Show recent bot activity for admin auditing."""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    try:
+        logs = bot.db.get_recent_activity(limit=10)
+        if not logs:
+            await ctx.send("ℹ️ No activity recorded yet.", ephemeral=True)
+            return
+
+        lines = []
+        for entry in logs:
+            lines.append(f"{entry['created_at']} | {entry['action']} | target={entry['target'] or 'n/a'} | actor={entry['actor'] or 'system'}")
+        embed = discord.Embed(title="Recent Activity", color=discord.Color.gold())
+        embed.description = "\n".join(lines)
+        await ctx.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in activity_log: {e}")
+        await ctx.send("❌ Error fetching activity log.", ephemeral=True)
+
+
+@bot.hybrid_command(name='set_quota', description='Set a user VPS quota (Admin only)')
+@app_commands.describe(
+    user="User to set a quota for",
+    quota="Maximum number of VPS instances"
+)
+async def set_quota(ctx, user: discord.User, quota: int):
+    """Set the maximum number of VPS instances a user may create."""
+    if not has_admin_role(ctx):
+        await ctx.send("❌ You must be an admin to use this command!", ephemeral=True)
+        return
+
+    if quota < 0:
+        await ctx.send("❌ Quota must be zero or greater.", ephemeral=True)
+        return
+
+    bot.db.set_user_quota(user.id, quota)
+    await ctx.send(f"✅ Quota for {user.mention} set to {quota}", ephemeral=True)
+
+
+@bot.hybrid_command(name='quota_status', description='Show your current VPS quota')
+async def quota_status(ctx):
+    """Show the current quota and usage for the requesting user."""
+    try:
+        quota_limit = bot.db.get_quota_limit(ctx.author.id, default=bot.db.get_setting('max_vps_per_user', MAX_VPS_PER_USER))
+        used = bot.db.get_user_vps_count(ctx.author.id)
+        embed = discord.Embed(title="VPS Quota", color=discord.Color.teal())
+        embed.add_field(name="Used", value=used, inline=True)
+        embed.add_field(name="Limit", value=quota_limit, inline=True)
+        embed.add_field(name="Remaining", value=max(quota_limit - used, 0), inline=True)
+        await ctx.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in quota_status: {e}")
+        await ctx.send("❌ Error fetching quota status.", ephemeral=True)
+
+
+@bot.hybrid_command(name='create_snapshot', description='Create a snapshot of a VPS')
+@app_commands.describe(
+    vps_id="ID of the VPS to snapshot"
+)
+async def create_snapshot(ctx, vps_id: str):
+    """Create a snapshot archive for a VPS."""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or (vps['created_by'] != str(ctx.author.id) and not has_admin_role(ctx)):
+            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
+            return
+
+        if not bot.docker_client:
+            await ctx.send("❌ Docker is unavailable.", ephemeral=True)
+            return
+
+        snapshot_id = generate_vps_id()[:8]
+        snapshot_dir = os.path.join('snapshots', vps_id)
+        os.makedirs(snapshot_dir, exist_ok=True)
+        snapshot_path = os.path.join(snapshot_dir, f"{snapshot_id}.tar")
+        await ctx.send(f"🔄 Creating snapshot {snapshot_id} for VPS {vps_id}...")
+        result = subprocess.run(["docker", "export", "-o", snapshot_path, vps['container_id']], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(result.stderr.strip() or result.stdout.strip())
+
+        size_bytes = os.path.getsize(snapshot_path) if os.path.exists(snapshot_path) else 0
+        bot.db.add_snapshot(vps_id, snapshot_id, snapshot_path, created_by=vps['created_by'], size_bytes=size_bytes)
+        bot.db.log_activity('create_snapshot', actor=str(ctx.author.id), target=vps_id, detail=snapshot_id)
+        await ctx.send(f"✅ Snapshot created: {snapshot_id} ({humanize_bytes(size_bytes)})", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in create_snapshot: {e}")
+        await ctx.send(f"❌ Error creating snapshot: {str(e)}", ephemeral=True)
+
+
+@bot.hybrid_command(name='list_snapshots', description='List snapshots for a VPS')
+@app_commands.describe(
+    vps_id="ID of the VPS"
+)
+async def list_snapshots(ctx, vps_id: str):
+    """List snapshots for a VPS."""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or (vps['created_by'] != str(ctx.author.id) and not has_admin_role(ctx)):
+            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
+            return
+
+        snapshots = bot.db.list_snapshots(vps_id)
+        if not snapshots:
+            await ctx.send("ℹ️ No snapshots found for this VPS.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title=f"Snapshots for VPS {vps_id}", color=discord.Color.blue())
+        for snapshot in snapshots:
+            embed.add_field(
+                name=snapshot['snapshot_id'],
+                value=f"{humanize_bytes(snapshot['size_bytes'])} | {snapshot['created_at']}",
+                inline=False
+            )
+        await ctx.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in list_snapshots: {e}")
+        await ctx.send("❌ Error listing snapshots.", ephemeral=True)
+
+
+@bot.hybrid_command(name='delete_snapshot', description='Delete a VPS snapshot')
+@app_commands.describe(
+    snapshot_id="ID of the snapshot"
+)
+async def delete_snapshot(ctx, snapshot_id: str):
+    """Delete a snapshot from the database and disk."""
+    try:
+        snapshots = bot.db.list_snapshots('')
+        snapshot_entry = None
+        for entry in bot.db.get_all_vps().values():
+            pass
+        # The snapshot lookup is done by scanning the database directly for the snapshot id.
+        # This keeps the feature simple and robust for the current storage model.
+        from sqlite3 import connect
+        with connect(DB_FILE) as temp_conn:
+            temp_cursor = temp_conn.cursor()
+            temp_cursor.execute('SELECT vps_id, path FROM snapshots WHERE snapshot_id = ?', (snapshot_id,))
+            row = temp_cursor.fetchone()
+            if row:
+                snapshot_entry = {'vps_id': row[0], 'path': row[1]}
+
+        if not snapshot_entry:
+            await ctx.send("❌ Snapshot not found.", ephemeral=True)
+            return
+
+        if os.path.exists(snapshot_entry['path']):
+            os.remove(snapshot_entry['path'])
+        deleted = bot.db.delete_snapshot(snapshot_id)
+        if deleted:
+            bot.db.log_activity('delete_snapshot', actor=str(ctx.author.id), target=snapshot_id, detail='removed')
+            await ctx.send(f"✅ Snapshot {snapshot_id} deleted.", ephemeral=True)
+        else:
+            await ctx.send("❌ Snapshot could not be deleted.", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in delete_snapshot: {e}")
+        await ctx.send("❌ Error deleting snapshot.", ephemeral=True)
+
+
 @bot.hybrid_command(name='help', description='Show all available commands')
 async def show_commands(ctx):
     """Show all available commands"""
@@ -868,6 +1176,10 @@ async def show_commands(ctx):
 `/vps_console <vps_id>` - Get direct console access to your VPS
 `/vps_usage` - Show your VPS usage statistics
 `/run_command <vps_id> <command>` - Run a command in your VPS
+`/quota_status` - Show your current VPS quota
+`/create_snapshot <vps_id>` - Create a VPS snapshot
+`/list_snapshots <vps_id>` - List VPS snapshots
+`/delete_snapshot <snapshot_id>` - Delete a VPS snapshot
 """, inline=False)
         
         # Admin commands
@@ -894,6 +1206,9 @@ async def show_commands(ctx):
 `/list_banned` - List banned users
 `/backup_data` - Backup all data
 `/restore_data` - Restore from backup
+`/activity_log` - Show recent bot activity
+`/set_quota <user> <quota>` - Set a user VPS quota
+`/toggle_auto_cleanup` - Enable or disable automatic cleanup
 `/reinstall_bot` - Reinstall the bot (Owner only)
 """, inline=False)
         
@@ -1054,11 +1369,12 @@ async def create_vps_flow(ctx, memory: int, cpu: int, disk: int, owner: discord.
                 await ctx.send(f"❌ Maximum container limit reached ({bot.db.get_setting('max_containers')}). Please delete some VPS instances first.", ephemeral=True)
             return
 
-        if bot.db.get_user_vps_count(owner.id) >= bot.db.get_setting('max_vps_per_user', MAX_VPS_PER_USER):
+        quota_limit = bot.db.get_quota_limit(owner.id, default=bot.db.get_setting('max_vps_per_user', MAX_VPS_PER_USER))
+        if bot.db.get_user_vps_count(owner.id) >= quota_limit:
             if isinstance(ctx, discord.Interaction):
-                await ctx.followup.send(f"❌ {owner.mention} already has the maximum number of VPS instances ({bot.db.get_setting('max_vps_per_user')})", ephemeral=True)
+                await ctx.followup.send(f"❌ {owner.mention} already has the maximum number of VPS instances ({quota_limit})", ephemeral=True)
             else:
-                await ctx.send(f"❌ {owner.mention} already has the maximum number of VPS instances ({bot.db.get_setting('max_vps_per_user')})", ephemeral=True)
+                await ctx.send(f"❌ {owner.mention} already has the maximum number of VPS instances ({quota_limit})", ephemeral=True)
             return
 
         if isinstance(ctx, discord.Interaction):
@@ -1163,6 +1479,7 @@ async def create_vps_flow(ctx, memory: int, cpu: int, disk: int, owner: discord.
         }
 
         bot.db.add_vps(vps_data)
+        bot.db.log_activity('create_vps', actor=str(owner.id), target=vps_id, detail=f"memory={memory} cpu={cpu} disk={disk}")
 
         try:
             embed = discord.Embed(title="🎉 HostForge VPS Creation Successful", color=discord.Color.green())
