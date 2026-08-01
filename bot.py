@@ -64,6 +64,13 @@ def get_env_setting(*names, default=None):
     return default
 
 
+def is_interaction_context(ctx) -> bool:
+    """Return True when the context is a Discord interaction-based command invocation."""
+    if isinstance(ctx, discord.Interaction):
+        return True
+    return hasattr(ctx, 'response') and hasattr(ctx, 'followup') and hasattr(ctx, 'user')
+
+
 # Bot configuration
 TOKEN = get_env_setting('DISCORD_TOKEN', 'BOT_TOKEN')
 HOST_IP = get_env_setting('HOST_IP', default=None)  # Optional, will fetch dynamically if not set

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from bot import Database, humanize_bytes, should_use_simulated_vps
+from bot import Database, humanize_bytes, is_interaction_context, should_use_simulated_vps
 
 
 def test_activity_log_and_quota_management(tmp_path):
@@ -33,3 +33,14 @@ def test_humanize_bytes_formats_sizes():
 
 def test_simulated_vps_mode_when_docker_is_unavailable():
     assert should_use_simulated_vps(None) is True
+
+
+def test_interaction_context_detection():
+    class DummyInteraction:
+        def __init__(self):
+            self.response = object()
+            self.followup = object()
+            self.user = object()
+
+    assert is_interaction_context(DummyInteraction()) is True
+    assert is_interaction_context(object()) is False
